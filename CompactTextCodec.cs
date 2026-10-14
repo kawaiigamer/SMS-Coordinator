@@ -1,21 +1,17 @@
-﻿
-using System;
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
-public static class CompactTextCodec
+public static unsafe class CompactTextCodec
 {
-    private const int MaxChars = 1024;
-
     private const byte CommonBase = 0;
     private const byte MainBase = 42;
 
-    private const byte SpaceCode = 141;
-    private const byte NewLineCode = 142;
-
-    private const byte HiraganaMode = 143;
-    private const byte KatakanaMode = 144;
-    private const byte MainMode = 145;
-    private const byte UnknownCode = 146;
+    private const byte SpaceCode = 248;
+    private const byte NewLineCode = 249;
+    private const byte HiraganaMode = 250;
+    private const byte KatakanaMode = 251;
+    private const byte MainMode = 252;
+    private const byte UnknownCode = 253;
 
     private const byte Invalid = 255;
 
@@ -24,8 +20,9 @@ public static class CompactTextCodec
 
     private const string Main =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" +
-        "БГДЖЗИЙЛПФЦЧШЩЪЫЬЭЮЯЇЄҐ" +
-        "бвгджзийлпфцчшщъыьэюяїєґ";
+        "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ" +
+        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя" +
+        "ЇЄҐїєґ";
 
     private const string Hiragana =
         "あいうえおかきくけこさしすせそたちつてとなにぬねの" +
@@ -33,231 +30,292 @@ public static class CompactTextCodec
         "がぎぐげござじずぜぞだぢづでどばびぶべぼ" +
         "ぱぴぷぺぽぁぃぅぇぉっゃゅょゎ";
 
-    // Исправлены ゼ・ゾ вместо ошибочно повторённых デ・ド
-    // в последовательности, указанной в исходном сообщении.
     private const string Katakana =
         "アイウエオカキクケコサシスセソタチツテトナニヌネノ" +
         "ハヒフヘホマミムメモヤユヨラリルレロワヲン" +
         "ガギグゲゴザジズゼゾダヂヅデドバビブベボ" +
         "パピプペポァィゥェォッャュョヮヵヶヴー";
 
-    private static readonly byte[] CharToCode = BuildCharTable();
+    private const string JapanesePunctuation =
+        "。，、〝〟「」『』【】⟨⟩〜：！？《》";
 
-    private static byte[] BuildCharTable()
+    private const string AsciiPunctuation =
+        ".,^\"'[]{}()<>~:!?#@";
+
+    private static readonly ushort* CharLookup;
+    private static readonly byte* JapanesePunctToCode;
+    private static readonly char* CodeToJapanesePunct;
+
+    static CompactTextCodec()
     {
-        var table = new byte[char.MaxValue + 1];
-        Array.Fill(table, Invalid);
+        CharLookup = (ushort*)NativeMemory.Alloc(
+            (nuint)(char.MaxValue + 1), sizeof(ushort));
 
-        if (Common.Length != 42)
-            throw new InvalidOperationException("Common length must be 42.");
+        JapanesePunctToCode = (byte*)NativeMemory.Alloc(
+            (nuint)(char.MaxValue + 1), 1);
 
-        if (Main.Length > 99)
-            throw new InvalidOperationException("Main row exceeds 99 symbols.");
+        CodeToJapanesePunct = (char*)NativeMemory.Alloc(
+            (nuint)(char.MaxValue + 1), sizeof(char));
 
-        if (Hiragana.Length > Main.Length ||
-            Katakana.Length > Main.Length)
+        NativeMemory.Fill(
+            CharLookup,
+            (nuint)(char.MaxValue + 1) * sizeof(ushort),
+            0xFF);
+
+        NativeMemory.Fill(
+            JapanesePunctToCode,
+            (nuint)(char.MaxValue + 1),
+            Invalid);
+
+        NativeMemory.Clear(
+            CodeToJapanesePunct,
+            (nuint)(char.MaxValue + 1) * sizeof(char));
+
+        AddRow(Main, 0);
+        AddRow(Hiragana, 1);
+        AddRow(Katakana, 2);
+
+        CharLookup['І'] = CharLookup['I'];
+        CharLookup['і'] = CharLookup['i'];
+
+        if (JapanesePunctuation.Length != AsciiPunctuation.Length)
             throw new InvalidOperationException(
-                "Japanese rows must fit the main row.");
+                "Punctuation rows must have equal length.");
 
-        for (int i = 0; i < Common.Length; i++)
+        if (MainBase + Main.Length >= SpaceCode)
+            throw new InvalidOperationException(
+                "Main row overlaps service codes.");
+
+        for (int i = 0; i < JapanesePunctuation.Length; i++)
         {
-            char c = Common[i];
-            if (table[c] != Invalid)
-                throw new InvalidOperationException("Duplicate common symbol.");
+            int code = Common.IndexOf(AsciiPunctuation[i]);
 
-            table[c] = (byte)(CommonBase + i);
+            if (code < 0)
+                throw new InvalidOperationException(
+                    "ASCII punctuation is absent in Common.");
+
+            JapanesePunctToCode[JapanesePunctuation[i]] = (byte)code;
+            CodeToJapanesePunct[code] = JapanesePunctuation[i];
         }
-
-        for (int i = 0; i < Main.Length; i++)
-        {
-            char c = Main[i];
-            if (table[c] != Invalid)
-                throw new InvalidOperationException("Duplicate main symbol.");
-
-            table[c] = (byte)(MainBase + i);
-        }
-
-        table[' '] = SpaceCode;
-        table['\n'] = NewLineCode;
-
-        return table;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int FindIndex(string row, char c)
+    private static void AddRow(string row, byte mode)
     {
-        return row.IndexOf(c);
+        for (int i = 0; i < row.Length; i++)
+        {
+            char c = row[i];
+
+            if (CharLookup[c] != ushort.MaxValue)
+                throw new InvalidOperationException("Duplicate symbol.");
+
+            CharLookup[c] = (ushort)((mode << 8) | i);
+        }
     }
 
-    // Максимальный результат: 2 * input.Length байт.
-    // Возвращает фактическую длину записанных данных.
-    public static unsafe int Compress(
+    public static int Compress(
         ReadOnlySpan<char> input,
         Span<byte> output)
     {
-        if (output.Length < input.Length * 2)
-            throw new ArgumentException("Output buffer is too small.");
-
-        int written = 0;
-        int mode = 0; // 0 = main, 1 = hiragana, 2 = katakana
-
         fixed (char* src = input)
         fixed (byte* dst = output)
         {
-            for (int i = 0; i < input.Length; i++)
+            int length = input.Length;
+            int capacity = output.Length;
+            int written = 0;
+            byte mode = 0;
+
+            for (int i = 0; i < length; i++)
             {
-                if (written >= output.Length)
-                {
-                    return -1;
-                }
                 char c = src[i];
+                ushort packed = CharLookup[c];
 
-                int hi = FindIndex(Hiragana, c);
-                int ki = FindIndex(Katakana, c);
-
-                if (hi >= 0 || ki >= 0)
+                if (packed != ushort.MaxValue)
                 {
-                    int nextMode = hi >= 0 ? 1 : 2;
+                    byte nextMode = (byte)(packed >> 8);
 
                     if (mode != nextMode)
                     {
-                        dst[written++] =
-                            nextMode == 1 ? HiraganaMode : KatakanaMode;
+                        if (written >= capacity)
+                            return -1;
+
+                        dst[written++] = nextMode switch
+                        {
+                            1 => HiraganaMode,
+                            2 => KatakanaMode,
+                            _ => MainMode
+                        };
 
                         mode = nextMode;
                     }
 
-                    int index = hi >= 0 ? hi : ki;
-                    dst[written++] = (byte)(MainBase + index);
+                    if (written >= capacity)
+                        return -1;
+
+                    dst[written++] = (byte)(MainBase + (packed & 0xFF));
                     continue;
                 }
 
-                // Неяпонский символ требует возврата в основной ряд.
+                byte punctuation = JapanesePunctToCode[c];
+
+                if (punctuation != Invalid)
+                {
+                    if (mode == 0)
+                    {
+                        if (written >= capacity)
+                            return -1;
+
+                        dst[written++] = HiraganaMode;
+                        mode = 1;
+                    }
+
+                    if (written >= capacity)
+                        return -1;
+
+                    dst[written++] = punctuation;
+                    continue;
+                }
+
                 if (mode != 0)
                 {
+                    if (written >= capacity)
+                        return -1;
+
                     dst[written++] = MainMode;
                     mode = 0;
                 }
 
-                byte code = CharToCode[c];
+                byte code = c switch
+                {
+                    ' ' => SpaceCode,
+                    '\n' => NewLineCode,
+                    _ => GetCode(c)
+                };
 
-                dst[written++] =
-                    code == Invalid ? UnknownCode : code;
+                if (written >= capacity)
+                    return -1;
+
+                dst[written++] = code;
             }
-        }
 
-        return written;
+            return written;
+        }
     }
 
-    // Возвращает число записанных UTF-16 символов.
-    public static unsafe int Decompress(
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static byte GetCode(char c)
+    {
+        int common = Common.IndexOf(c);
+
+        if (common >= 0)
+            return (byte)common;
+
+        int main = Main.IndexOf(c);
+        return main >= 0 ? (byte)(MainBase + main) : UnknownCode;
+    }
+
+    public static int Decompress(
         ReadOnlySpan<byte> input,
         Span<char> output)
     {
-        if (output.Length < input.Length * 2)
-            throw new ArgumentException("Output buffer is too small."); 
-
-        int written = 0;
-        int mode = 0;
-
         fixed (byte* src = input)
         fixed (char* dst = output)
         {
-            for (int i = 0; i < input.Length; i++)
-            {   
-                if (written >= output.Length)
-                {
-                    return -1;
-                }
+            int length = input.Length;
+            int capacity = output.Length;
+            int written = 0;
+            byte mode = 0;
+
+            for (int i = 0; i < length; i++)
+            {
                 byte code = src[i];
 
-                if (code == HiraganaMode)
+                if (written >= capacity)
+                    return -1;
+
+                switch (code)
                 {
-                    mode = 1;
-                    continue;
-                }
+                    case HiraganaMode:
+                        mode = 1;
+                        continue;
 
-                if (code == KatakanaMode)
-                {
-                    mode = 2;
-                    continue;
-                }
+                    case KatakanaMode:
+                        mode = 2;
+                        continue;
 
-                if (code == MainMode)
-                {
-                    mode = 0;
-                    continue;
-                }
+                    case MainMode:
+                        mode = 0;
+                        continue;
 
-                if (code == UnknownCode)
-                {
-                    if (mode != 0)
-                        throw new FormatException(
-                            "Unknown symbol must be in main mode.");
+                    case SpaceCode:
+                        RequireMainMode(mode);
+                        dst[written++] = ' ';
+                        continue;
 
-                    dst[written++] = '¿';
-                    continue;
-                }
+                    case NewLineCode:
+                        RequireMainMode(mode);
+                        dst[written++] = '\n';
+                        continue;
 
-                if (code == SpaceCode)
-                {
-                    if (mode != 0)
-                        throw new FormatException("Invalid space code.");
-
-                    dst[written++] = ' ';
-                    continue;
-                }
-
-                if (code == NewLineCode)
-                {
-                    if (mode != 0)
-                        throw new FormatException("Invalid newline code.");
-
-                    dst[written++] = '\n';
-                    continue;
+                    case UnknownCode:
+                        RequireMainMode(mode);
+                        dst[written++] = '¿';
+                        continue;
                 }
 
                 if (code < MainBase)
                 {
-                    if (mode != 0)
-                        throw new FormatException(
-                            "Common symbols require main mode.");
-
-                    int index = code - CommonBase;
-
-                    if ((uint)index >= (uint)Common.Length)
+                    if (code >= Common.Length)
                         throw new FormatException("Invalid common code.");
 
-                    dst[written++] = Common[index];
+                    char japanese = CodeToJapanesePunct[code];
+
+                    if (mode != 0)
+                    {
+                        if (japanese == '\0')
+                            throw new FormatException(
+                                "Only mapped punctuation is valid in Japanese mode.");
+
+                        dst[written++] = japanese;
+                        continue;
+                    }
+
+                    dst[written++] = Common[code];
                     continue;
                 }
 
-                int mainIndex = code - MainBase;
+                int index = code - MainBase;
 
-                if (mode == 1)
+                if (mode == 0)
                 {
-                    if ((uint)mainIndex >= (uint)Hiragana.Length)
+                    if ((uint)index >= (uint)Main.Length)
+                        throw new FormatException("Invalid main code.");
+
+                    dst[written++] = Main[index];
+                }
+                else if (mode == 1)
+                {
+                    if ((uint)index >= (uint)Hiragana.Length)
                         throw new FormatException("Invalid hiragana code.");
 
-                    dst[written++] = Hiragana[mainIndex];
-                }
-                else if (mode == 2)
-                {
-                    if ((uint)mainIndex >= (uint)Katakana.Length)
-                        throw new FormatException("Invalid katakana code.");
-
-                    dst[written++] = Katakana[mainIndex];
+                    dst[written++] = Hiragana[index];
                 }
                 else
                 {
-                    if ((uint)mainIndex >= (uint)Main.Length)
-                        throw new FormatException("Invalid main code.");
+                    if ((uint)index >= (uint)Katakana.Length)
+                        throw new FormatException("Invalid katakana code.");
 
-                    dst[written++] = Main[mainIndex];
+                    dst[written++] = Katakana[index];
                 }
             }
-        }
 
-        return written;
+            return written;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void RequireMainMode(byte mode)
+    {
+        if (mode != 0)
+            throw new FormatException("This code requires main mode.");
     }
 }
